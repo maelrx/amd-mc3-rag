@@ -1,0 +1,9 @@
+.firecrawl/
+eval/suites/
+stage/
+wheels/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+SUBMISSION.md
