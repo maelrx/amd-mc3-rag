@@ -15,6 +15,7 @@ import time
 import zipfile
 from pathlib import Path
 
+import chainguard
 import cite
 import config
 import gates
@@ -25,6 +26,7 @@ import snap
 import textnorm
 import verify
 import vision
+import warrant
 from budget import Deadline, Trace
 from schema import Record, Result, Verdict, refusal
 
@@ -265,6 +267,12 @@ def _answer(run: _Run, index, reader, query: str, deadline: Deadline, corpus: Pa
         trace.note("coverage_final", round(cov_final, 2))
         if cov_final < config.COVERAGE_REFUSE:
             return run.refuse("LOW_COVERAGE")
+    if config.CHAIN_GUARD:
+        with trace.stage("chain_guard"):
+            swapped = chainguard.apply(q, v, out, pkg, index, reader, query, deadline, trace)
+        if swapped is not None:
+            v, out, pkg, images = swapped
+            run.attempts = 2
     run.support_rid = v.support_rid
 
     # optional second look at the pixels; an error or an empty VQA keeps the answer
@@ -289,19 +297,40 @@ def _answer(run: _Run, index, reader, query: str, deadline: Deadline, corpus: Pa
     conf = config.CONF_CHAIN if v.bridge_rids else (config.CONF_IMAGE if sup_src in _IMAGE_SRC else config.CONF_SINGLE)
     run.best = Result(ans, cites, conf, {})
 
-    if config.GATE_B:
+    mode = gates.gate_b_mode()
+    if mode != "0":
+        # "log": same signals, recorded in the trace, never refuses. "1": refuses below the thresholds.
+        # Any error inside the gate keeps the verified answer (explicit fail-open, with a note).
         with trace.stage("gate_b"):
-            gain = None
-            if deadline.require(config.LOO_MIN_REMAINING_S):
-                try:
-                    drop = [v.support_rid, *v.bridge_rids]
-                    gain = _context_gain(reader, _with_image_notes(pkg.text, images), query, images, ans, drop,
-                                         drop_image=any(index.record(r).src in _IMAGE_SRC for r in drop))
-                except Exception as e:  # noqa: BLE001
-                    trace.note("gate_b_error", repr(e))
-            trace.note("context_gain", gain)
-            if not gates.gate_b(out, gain):
-                return run.refuse("GATE_B")
+            try:
+                gain = None
+                if deadline.require(config.LOO_MIN_REMAINING_S):
+                    try:
+                        drop = [v.support_rid, *v.bridge_rids]
+                        gain = _context_gain(reader, _with_image_notes(pkg.text, images), query, images, ans, drop,
+                                             drop_image=any(index.record(r).src in _IMAGE_SRC for r in drop))
+                    except Exception as e:  # noqa: BLE001
+                        trace.note("gate_b_error", repr(e))
+                trace.note("context_gain", gain)
+                trace.note("gate_b_s1", out.mean_logprob)
+                keep = gates.gate_b(out, gain)
+                if mode == "log":
+                    trace.note("gate_b_would_refuse", not keep)
+                elif not keep:
+                    return run.refuse("GATE_B")
+            except Exception as e:  # noqa: BLE001
+                trace.note("gate_b_error", repr(e))
+
+    wmode = warrant.mode()
+    if wmode != "0":
+        # H6: "log" records the YES/NO score, never refuses. "1" refuses below WARRANT_THETA. An error keeps the answer.
+        with trace.stage("warrant"):
+            try:
+                score = warrant.check(reader, index, q, v, pkg, out, deadline, trace, images, ans)
+                if wmode == "1" and score is not None and score < config.WARRANT_THETA:
+                    return run.refuse("WARRANT")
+            except Exception as e:  # noqa: BLE001
+                trace.note("warrant_error", repr(e))
     return run.finish(run.best, "OK")
 
 

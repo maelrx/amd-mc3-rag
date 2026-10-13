@@ -1,0 +1,7 @@
+[
+  {"name": "base_logs", "env": {"MC3_GATE_B": "log", "MC3_WARRANT": "log"}},
+  {"name": "join2", "env": {"MC3_XLSX_JOIN": "1"}},
+  {"name": "pdfcols2", "env": {"MC3_PDF_COLS": "1"}},
+  {"name": "label", "env": {"MC3_LABEL_STRIP": "1"}},
+  {"name": "combo", "env": {"MC3_XLSX_JOIN": "1", "MC3_PDF_COLS": "1", "MC3_LABEL_STRIP": "1", "MC3_CHAIN_GUARD": "1", "MC3_WARRANT": "log"}}
+]

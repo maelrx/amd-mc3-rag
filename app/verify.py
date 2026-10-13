@@ -316,12 +316,104 @@ def _names_sibling_only(text: str, entity: str) -> bool:
     return seen_sibling and not seen_self
 
 
+# H1 type guard: questions whose answer is a quantity never take a part-number-shaped span
+_NUMERIC_ATTRS = {"price", "cost", "lead_time", "temperature", "timeout", "voltage", "weight", "speed"}
+_IDENT_ATTRS = {"part_number", "serial", "version", "revision", "error_code", "pin", "schedule"}
+_HOW_QTY_RE = re.compile(r"\bhow\s+(?:many|much|long)\b", re.I)
+_VERSIONISH_RE = re.compile(r"v?\d+(?:\.\d+)+[A-Za-z]?", re.I)
+# quantity-shaped tokens that mix digits and letters: 14d, 6wk, 100GbE, 400G, x16, 16x, PCIe5, DDR5-4800, 3V3
+_QTY_SHAPED_RE = re.compile(r"^\d+(?:\.\d+)?[A-Za-z]{1,4}$|^[xX]\d+$|^\d+[xX]$|PCIe\d|DDR\d-\d+|\dV\d", re.I)
+
+
+def _asks_quantity(q: Q) -> bool:
+    attrs = set(q.attr_terms)
+    if attrs & _IDENT_ATTRS:
+        return False
+    return bool(attrs & _NUMERIC_ATTRS) or bool(_HOW_QTY_RE.search(q.text)) or ("power" in attrs and bool(q.unit))
+
+
+def _type_mismatch(q: Q, span: str) -> bool:
+    """A single token mixing letters and digits ("TAM-BOM-6460-A", "E7731") answering a quantity question."""
+    t = span.strip()
+    if not t or re.search(r"\s", t) or _VERSIONISH_RE.fullmatch(t) or _QTY_SHAPED_RE.search(t):
+        return False
+    return (bool(re.search(r"[A-Za-z]", t)) and bool(re.search(r"\d", t)) and textnorm.is_identifier(t)
+            and _asks_quantity(q))
+
+
+# ---- H1 join eligibility / H8 date condition (flag-gated)
+
+_JOIN_SEP = " || "
+# words that describe the asked quantity, not the thing it is about
+_JOIN_ATTR_WORDS = frozenset("""
+price prices cost costs lead time times unit units volume quantity qty usd dollar dollars week weeks day days
+month months hour hours many much long total each per number count amount
+""".split())
+
+
+def _join_parts(text: str) -> tuple[str, str]:
+    """(R part, S part) of a join record "[join] R || S"."""
+    body = text[len("[join] "):] if text.startswith("[join] ") else text
+    r, _, s_part = body.partition(_JOIN_SEP)
+    return r, s_part
+
+
+def _join_word_ok(q: Q, text: str) -> bool:
+    """A join record may support an answer only when a content word of the question is in its S part
+    (the other-sheet row that supplies the product): "power supply" yes, "unit price ... volume" no."""
+    skip = {textnorm.nid(i) for i in q.ids} | {textnorm.nid(e) for e in q.entities}
+    for raw in (*q.ids, *q.entities):   # "TQ-40" must not leave "tq" behind as a content word
+        skip.update(textnorm.stem(x) for x in re.split(r"[-._/]", textnorm.fold_dashes(raw).lower()) if x)
+        skip.add(textnorm.fold_dashes(raw).lower())
+    words = set()
+    for t in textnorm.tokens(q.text):
+        if (t in skip or t in _FRAME_WORDS or t in textnorm.STOPWORDS or t in _JOIN_ATTR_WORDS
+                or not any(c.isalpha() for c in t) or textnorm.nid(t) in skip or any(c.isdigit() for c in t)):
+            continue
+        words.add(_stem(t))
+    s_part = _join_parts(text)[1]
+    have = {_stem(t) for t in textnorm.tokens(s_part)}
+    return any(_covers(w, have) for w in words)
+
+
+_MONTHS = {m: i for i, names in enumerate(
+    ("jan january", "feb february", "mar march", "apr april", "may", "jun june", "jul july", "aug august",
+     "sep sept september", "oct october", "nov november", "dec december"), 1) for m in names.split()}
+_MON_RE = r"(?:" + "|".join(sorted(_MONTHS, key=len, reverse=True)) + r")"
+_DATE_RES = (
+    (re.compile(r"(?<!\d)(\d{4})[-_/.]?(\d{2})[-_/.]?(\d{2})(?!\d)"), "ymd"),
+    (re.compile(rf"(?<![A-Za-z])({_MON_RE})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})(?!\d)", re.I), "mdy"),
+    (re.compile(rf"(?<!\d)(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MON_RE})\.?,?\s+(\d{{4}})(?!\d)", re.I), "dmy"),
+)
+
+
+def _dates_in(text: str) -> set[tuple[int, int, int]]:
+    """Calendar dates (y, m, d) written as 2026-09-23 / 20260923 / September 23, 2026 / 23 Sep 2026."""
+    out = set()
+    t = textnorm.fold_dashes(str(text))
+    for rx, kind in _DATE_RES:
+        for m in rx.finditer(t):
+            a, b, c = m.groups()
+            if kind == "ymd":
+                y, mo, d = int(a), int(b), int(c)
+            elif kind == "mdy":
+                y, mo, d = int(c), _MONTHS[a.lower()], int(b)
+            else:
+                y, mo, d = int(c), _MONTHS[b.lower()], int(a)
+            if 1 <= mo <= 12 and 1 <= d <= 31 and 1900 <= y <= 2200:
+                out.add((y, mo, d))
+    return out
+
+
 def _check(q: Q, index, rid: int, span: str) -> str | None:
     """First hard-failure code of a candidate, else None."""
     r = index.record(rid)
+    is_join = config.XLSX_JOIN and r.src == "join"
+    if is_join and not _join_word_ok(q, r.text):
+        return "ENTITY_MISMATCH"
     have: set[str] = set()
     if q.numbers:
-        for n in textnorm.numbers(r.text):
+        for n in textnorm.numbers(_join_parts(r.text)[0] if is_join else r.text):   # join: R part only
             have |= _num_forms(n)
     ctx: set[str] | None = None
     for n in q.numbers:
@@ -329,11 +421,15 @@ def _check(q: Q, index, rid: int, span: str) -> str | None:
             continue
         if ctx is None:   # "2.0" is in the path v2.0/release_manifest.txt, not in the row: that still conditions it
             ctx = set()
-            for t in (index.file_of(rid).file, *_context_texts(index, rid)):
+            for t in ((index.file_of(rid).file,) if is_join else (index.file_of(rid).file, *_context_texts(index, rid))):
                 for x in textnorm.numbers(t):
                     ctx |= _num_forms(x)
         if not (_num_forms(n) & ctx):
             return "COND_MISMATCH"
+    if config.DATE_COND:
+        qd = _dates_in(q.text)
+        if qd and not (qd & (_dates_in(r.text) | _dates_in(index.file_of(rid).file))):
+            return "DATE_MISMATCH"
     for ent in q.entities:
         if not _entity_ok(index, rid, ent):
             return "ENTITY_MISMATCH"
@@ -343,6 +439,8 @@ def _check(q: Q, index, rid: int, span: str) -> str | None:
         u = _span_unit(r.text, span)
         if u is not None and u != _canon_unit(q.unit):
             return "UNIT_MISMATCH"
+    if is_join and _type_mismatch(q, span):
+        return "TYPE_MISMATCH"
     return None
 
 
@@ -453,15 +551,20 @@ def verify(q: Q, out: ReaderOut, pkg: Package, index) -> Verdict:
             continue
         fe = index.file_of(rid)
         # a record reached by a rare-ID hop is the chain's end: it beats a direct decoy that merely shares words
-        scored.append((_attr_score(q, index.record(rid).text),
-                       1 if rid in pkg.via else 0,
-                       1 if (q.type_hint and kind_matches(fe.kind, q.type_hint)) else 0,
-                       round(coverage(q, index, rid), 2), _authority(fe),
-                       1 if rid in out.support else 0, -pos, rid))
+        attr = _attr_score(q, index.record(rid).text)
+        hop_target = 1 if rid in pkg.via else 0
+        kind_match = 1 if (q.type_hint and kind_matches(fe.kind, q.type_hint)) else 0
+        cov = round(coverage(q, index, rid), 2)
+        if config.RANK == "cov_first":   # H4: coverage before the hop target
+            scored.append((attr, cov, hop_target, kind_match, _authority(fe),
+                           1 if rid in out.support else 0, -pos, rid))
+        else:
+            scored.append((attr, hop_target, kind_match, cov, _authority(fe),
+                           1 if rid in out.support else 0, -pos, rid))
     if not scored:
         code = Counter(fails.values()).most_common(1)[0][0]
         return Verdict(False, code, violators=list(kept))
-    score, _hop, _kind, _cov, _auth, _hint, _pos, best = max(scored)
+    score, *_rest, best = max(scored)
     if not textnorm.is_identifier(spans[best]) and not _BOUND_Q_RE.search(q.text) \
             and _in_range_expr(index.record(best).text, spans[best]):
         return Verdict(False, "RANGE", violators=[best])   # one end of "between 8 and 14" is not the value
@@ -473,9 +576,39 @@ def verify(q: Q, out: ReaderOut, pkg: Package, index) -> Verdict:
                    grounding_score=score, violators=[], premise_files=premise)
 
 
+_LEAD_WORDS_RE = re.compile(r"^((?:[A-Za-z]{2,}[\s:#]+){1,3})(?=\S*\d)")
+_VALUE_WORDS = {
+    "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november",
+    "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+    "week", "weeks", "wk", "month", "months", "quarter", "year", "years", "day", "days", "fy", "q",
+    "sprint", "phase", "stage", "step", "level", "tier", "gen", "generation",
+}
+
+
+def _strip_question_label(span: str, q: Q | None) -> str:
+    """H7: a printed field label copied with the value, whose words the question itself uses
+    ("Which bin location ...?" + "BIN D-14-2" -> "D-14-2"). Only all-letter leading words, each a whole word
+    of the question; the remainder must still hold a digit."""
+    if q is None:
+        return span
+    m = _LEAD_WORDS_RE.match(span.strip())
+    if not m:
+        return span
+    words = re.findall(r"[A-Za-z]+", m.group(1))
+    qwords = {w.lower() for w in re.findall(r"[A-Za-z]+", q.text)}
+    if not words or not all(w.lower() in qwords for w in words):
+        return span
+    if any(w.lower() in _VALUE_WORDS for w in words):
+        return span     # "September 23, 2026", "Week 12", "Quarter 3": the word is part of the value
+    rest = span.strip()[m.end(1):].strip()
+    return rest if rest and re.search(r"\d", rest) else span
+
+
 def answer_text(verdict: Verdict, q: Q | None = None) -> str:
     """Final answer string: bare number for quantities, identifiers verbatim."""
     span = verdict.answer_span
     if not span:
         return ""
+    if config.LABEL_STRIP:
+        span = _strip_question_label(span, q)
     return snap.clean(span, is_identifier=True if textnorm.is_identifier(span) else None)

@@ -1,0 +1,6 @@
+[
+  {"name": "base_logs", "env": {"MC3_GATE_B": "log", "MC3_WARRANT": "log"}},
+  {"name": "date", "env": {"MC3_DATE_COND": "1"}},
+  {"name": "cand_nojoin", "env": {"MC3_PDF_COLS": "1", "MC3_LABEL_STRIP": "1", "MC3_CHAIN_GUARD": "1", "MC3_DATE_COND": "1", "MC3_GATE_B": "log", "MC3_WARRANT": "log"}},
+  {"name": "cand", "env": {"MC3_XLSX_JOIN": "1", "MC3_PDF_COLS": "1", "MC3_LABEL_STRIP": "1", "MC3_CHAIN_GUARD": "1", "MC3_DATE_COND": "1", "MC3_GATE_B": "log", "MC3_WARRANT": "log"}}
+]

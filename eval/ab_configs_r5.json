@@ -1,0 +1,4 @@
+[
+  {"name": "v5", "env": {}},
+  {"name": "v6", "env": {"MC3_XLSX_JOIN": "1", "MC3_PDF_COLS": "1", "MC3_LABEL_STRIP": "1", "MC3_CHAIN_GUARD": "1", "MC3_WARRANT": "1", "MC3_WARRANT_T": "-6"}}
+]

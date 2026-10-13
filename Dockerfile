@@ -26,6 +26,10 @@ RUN python3 -c "from huggingface_hub import snapshot_download as d; d('$MODEL_RE
 RUN python3 /app/checks.py weights $MC3_MODEL
 
 ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+# v6 verification/parsing features (code defaults reproduce v5; the image turns them on):
+# cross-sheet xlsx joins, per-product PDF family-table rows, printed-label strip, named-kind chain guard,
+# model warrant check (YES/NO log-odds below -6 -> refuse)
+ENV MC3_XLSX_JOIN=1 MC3_PDF_COLS=1 MC3_LABEL_STRIP=1 MC3_CHAIN_GUARD=1 MC3_WARRANT=1 MC3_WARRANT_T=-6
 COPY app/ /app/
 RUN python3 -m compileall -q /app && mkdir -p /app/corpus /app/output /app/index
 HEALTHCHECK --interval=10s --timeout=3s --start-period=600s CMD test -S /tmp/mc3.sock || exit 1

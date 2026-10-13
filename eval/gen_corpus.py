@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Adversarial MC3 corpus + gold generator (v1: traps T1-T12, T13-T24 + canaries).
+"""Adversarial MC3 corpus + gold generator (v1: traps T1-T12, T13-T24 + canaries; opt-in v2: T25-T28).
 
     python3 eval/gen_corpus.py --seed 1 --out eval/suites/s1 [--n-files 40] [--traps T1,T2,...]
+    python3 eval/gen_corpus.py --seed 201 --out eval/suites/p1a --traps T25,T26,T27,T28      # probe (v2 traps are opt-in)
+    python3 eval/gen_corpus.py --seed 301 --out eval/suites/s5 --n-files 300 --n-images 60 \\
+        --traps T1,T6,T7,T20,T23 --max-refusals 6                                           # scale suite
 
 Writes <out>/corpus/ (the files), <out>/questions.json (EXACTLY the format of
 sample-questions.json), <out>/traps.json ({query n: trap id}) and <out>/MANIFEST.txt.
@@ -33,6 +36,11 @@ import sys
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+
+# Opt-in traps (v2): only run via --traps, never part of the default list, so existing seeds stay reproducible.
+EXTRA_TRAPS = ["T25", "T26", "T27", "T28"]
+# T28 re-uses the attribute names of the T1/T5/T8 datasheets for the product family (with its own values)
+TRAP_CONFLICTS = {"T28": ("T1", "T2", "T5", "T8", "T14")}
 
 TRAPS = ["T1", "T2", "T3", "T4", "T5", "T6", "T7", "T8", "T9", "T10", "T11", "T12",
          "T13", "T14b", "T15b", "T17b", "T18b", "T19b", "T20", "T21", "T22", "T23", "T24"]
@@ -80,6 +88,30 @@ SYMPTOMS = [
      "Die temperature sensor reports high under sustained small-batch load", "power"),
     ("DMA descriptor ring overrun on engine 5", "DMA ring overrun",
      "Producer index wraps early when completion batching is enabled", "dma"),
+]
+# (log text, noun phrase used in questions, ticket summary that shares NO words with the noun, component)
+# T26/T27 events: none of them is a coolant-pump / coolant-loop / fan-tray event (T6 canary, T23) or one of SYMPTOMS.
+EVENTS = [
+    ("chiller compressor tripped on overcurrent", "chiller compressor trip",
+     "Inrush limiter threshold is read from the wrong register", "hvac"),
+    ("rack door sensor reports open during operation", "rack door alarm",
+     "Debounce counter is shared between two contacts", "facilities"),
+    ("firmware watchdog expired on port 2, link reset", "NIC watchdog expiry",
+     "Keepalive timer restarts on every received frame", "network"),
+    ("wear counter above 90 percent on slot 1", "flash wear alert",
+     "Erase-cycle tally saturates at an 8-bit boundary", "storage"),
+    ("manifold flow sensor reads zero", "flow sensor dropout",
+     "Pulse counter overflows at high rotor speed", "thermal"),
+    ("self-test failed on battery backup unit 2", "backup battery failure",
+     "Load-test window ends before the voltage settles", "power"),
+    ("bus transaction timed out, bus recovered", "SMBus timeout",
+     "Clock-stretch limit is not honoured by the secondary device", "firmware"),
+    ("lane group 2 skew above tolerance after retrain", "clock skew warning",
+     "Phase detector gain is mis-scaled after link recovery", "clocking"),
+    ("scrub pass aborted by supervisor", "memory scrub abort",
+     "Patrol engine yields to a higher priority task indefinitely", "memory"),
+    ("inlet filter differential pressure above limit", "filter clog warning",
+     "Transducer offset drifts with ambient humidity", "facilities"),
 ]
 GENERIC_BUGS = [
     ("firmware", "Release notes omit ticket list for {v}"),
@@ -401,6 +433,9 @@ def write_pdf(doc: Doc, dest: Path):
             pdf.ln(3)
             pdf.set_font("Helvetica", "B", 12)
             h = 7
+        elif style == "mono":       # fixed-pitch line: padded columns stay aligned (spec tables)
+            pdf.set_font("Courier", "", 9)
+            h = 5.5
         else:
             pdf.set_font("Helvetica", "", 11)
             h = 6.5
@@ -501,8 +536,9 @@ def write_doc(doc: Doc, dest: Path):
 # ------------------------------------------------------------------ context
 
 class Ctx:
-    def __init__(self, seed: int, attempt: int, traps: list[str], n_files: int):
+    def __init__(self, seed: int, attempt: int, traps: list[str], n_files: int, n_images: int = 0):
         self.seed, self.attempt, self.traps, self.n_files = seed, attempt, traps, n_files
+        self.n_images = n_images
         self.rng = random.Random(f"mc3:{seed}:{attempt}")
         self.rng_fill = random.Random(f"mc3fill:{seed}:{attempt}")
         self.u = make_universe(self.rng, seed)
@@ -1930,6 +1966,513 @@ def trap_T24(ctx: Ctx):
     ctx.cache["T24"] = {}
 
 
+# ------------------------------------------------------------------ v2 traps (opt-in: --traps T25,...)
+
+def _events(ctx: Ctx) -> list:
+    """EVENTS in a per-seed order shared by T26/T27: T26 takes [0:3] (+[7] as its canary), T27 takes [3:7]."""
+    ev = EVENTS[:]
+    ctx.xr("EVT").shuffle(ev)
+    return ev
+
+
+def _log_lines(r: random.Random, node: str, svc: str, date: dt.date, specials: list, n: int = 24) -> list:
+    """A service log for `date`: n routine INFO/WARN lines with the (level, message) `specials` spread among them."""
+    t = dt.datetime.combine(date, dt.time(r.randint(0, 20), r.randint(0, 59), r.randint(0, 59)))
+    slots = sorted(r.sample(range(3, n), len(specials)))
+    out, k = [], 0
+    for i in range(n):
+        t += dt.timedelta(seconds=r.randint(5, 240))
+        if k < len(slots) and i == slots[k]:
+            level, msg = specials[k]
+            k += 1
+        else:
+            level, msg = [("INFO", f"scheduler: batch {r.randint(10000, 99999)} accepted, {r.randint(8, 128)} requests"),
+                          ("INFO", f"thermal: die {r.randint(0, 3)} at {r.randint(60, 78)}C, within envelope"),
+                          ("INFO", f"heartbeat ok, uptime {r.randint(2, 400)}h"),
+                          ("INFO", f"telemetry: exported {r.randint(100, 9000)} samples"),
+                          ("WARN", f"thermal: die {r.randint(0, 3)} at {r.randint(82, 90)}C, approaching limit")][r.randrange(5)]
+        out.append(f"{t.strftime('%Y-%m-%dT%H:%M:%SZ')} {node} {svc}[{r.randint(1000, 4999)}]: {level:<5} {msg}")
+    return out
+
+
+def trap_T25(ctx: Ctx):
+    """xlsx cross-sheet join: Parts (product, component, part_number) + LeadTimes / Costs keyed ONLY by part_number."""
+    u, r = ctx.u, ctx.xr("T25")
+    lo, mid, hi = sorted(("p1", "p0", "p2"), key=lambda k: int(u.p[k].rsplit("-", 1)[1]))
+    prods = [u.p[lo], u.p[mid], u.p[hi]]
+    comps = ["Retimer board", "Midplane connector", "Battery backup unit", "Rail kit", "Expansion riser", "Front bezel"]
+    r.shuffle(comps)
+    only = comps.pop()                                # exists for ONE product only (canary: ask it for another product)
+    only_prod = prods[r.randrange(3)]
+    taken, lead_used, cost_used = set(), set(), set()
+
+    def pn():
+        while True:
+            x = xpart(r, u, "BOM")
+            if x not in taken:
+                taken.add(x)
+                return x
+
+    def uniq(draw, used):
+        while True:
+            v = draw()
+            if v not in used:
+                used.add(v)
+                return v
+    rows, lt, costs, info = [], [], [], {}
+    for comp in comps + [only]:
+        for prod in prods:
+            if comp == only and prod != only_prod:
+                continue
+            part, weeks = pn(), uniq(lambda: r.randint(3, 26), lead_used)
+            rows.append((prod, comp, part, f"{comp}, {prod} series", r.choice(["active", "active", "preferred"])))
+            lt.append((part, weeks, r.choice(SUPPLIERS)))
+            brk = {b: uniq(lambda: r.randrange(20 * 4, 400 * 4) / 4, cost_used) for b in (100, 1000, 5000)}
+            costs += [(part, b, c) for b, c in brk.items()]
+            info[(prod, comp)] = {"part": part, "weeks": weeks, "cost": brk}
+    for lst in (rows, lt, costs):
+        r.shuffle(lst)
+    path = f"procurement/{slug(u.pre)}_bom_costs.xlsx"
+    ctx.doc(path, "xlsx").sheets = [
+        {"name": "Parts", "title": f"{u.company} - {u.pre} series bill of parts (FY{u.fy})",
+         "header": ["product", "component", "part_number", "description", "status"], "rows": rows},
+        {"name": "LeadTimes", "header": ["part_number", "lead_time_weeks", "supplier"], "rows": lt},
+        {"name": "Costs", "header": ["part_number", "qty_break", "unit_cost_usd"], "rows": costs,
+         "money": ["unit_cost_usd"], "shown": [(a, b, f"{c:.2f}") for a, b, c in costs]},
+        {"name": "Notes", "header": ["note"],
+         "rows": [("Lead times and costs are keyed by part_number; product and component are on the Parts sheet.",)]}]
+    pr = prods[:]
+    r.shuffle(pr)
+    asked = [(pr[0], comps[0]), (pr[1], comps[0]), (pr[2], comps[1])]       # 1st/2nd: same component, sibling products
+    for prod, comp in asked:
+        e = info[(prod, comp)]
+        sibs = ", ".join(f"{info[(q, comp)]['weeks']} ({q})" for q in prods if q != prod)
+        ctx.q("T25", f"What is the lead time, in weeks, of the {comp.lower()} for the {prod}?", str(e["weeks"]), [path],
+              "xlsx, cross-sheet join (product on Parts, lead time on LeadTimes via part_number)",
+              aliases=[f"{e['weeks']} weeks"],
+              note=f"Parts maps {prod} + {comp} to {e['part']}; LeadTimes holds {e['weeks']} for that part number and never "
+                   f"names the product. The sibling products' rows are the near-misses: {sibs}.")
+    cprod, ccomp = prods[1], comps[2]
+    e = info[(cprod, ccomp)]
+    s, al = money(e["cost"][1000])
+    ctx.q("T25", f"What is the unit cost in USD of the {ccomp.lower()} for the {cprod} at 1000 unit volume?", s, [path],
+          "xlsx, cross-sheet join + quantity break (Costs has one row per part and break)", aliases=al,
+          note=f"{e['part']}: {e['cost'][100]:.2f} at 100, {e['cost'][1000]:.2f} at 1000, {e['cost'][5000]:.2f} at 5000.")
+    ctx.cache["T25"] = {"path": path, "only": only, "other_prod": [q for q in prods if q != only_prod][0],
+                        "only_prod": only_prod, "cprod": cprod, "ccomp": ccomp}
+
+
+def trap_T26(ctx: Ctx):
+    """Chain with a topical decoy: log -> ticket id -> csv fixed_in, while the csv also holds a DECOY ticket whose
+    summary uses the question's own words (different ticket, different fixed_in)."""
+    u, r = ctx.u, ctx.xr("T26")
+    ev = _events(ctx)
+    major, minor = u.ver_base.split(".")
+    taken_v, taken_t, taken_e = set(), set(), {u.e6, u.e7, u.e_dec, u.nx_err}
+
+    def ver():
+        while True:
+            v = f"{major}.{minor}.{r.randint(10, 39)}"          # patch >= 10: never in the release notes / bug database
+            if v not in taken_v:
+                taken_v.add(v)
+                return v
+
+    def tick():
+        while True:
+            t = f"{u.tix}-{r.randint(4000, 4999)}"
+            if t not in taken_t:
+                taken_t.add(t)
+                return t
+
+    def code():
+        while True:
+            c = f"E{r.randint(1000, 9999)}"
+            if c not in taken_e:
+                taken_e.add(c)
+                return c
+    decoy_tpl = ["{N} counter is not exposed through the status subcommand",
+                 "Runbook section on {n} recovery is outdated",
+                 "{N} events are missing from the exported telemetry",
+                 "{N} threshold wording in the integration guide is ambiguous"]
+    cap = lambda s_: s_[0].upper() + s_[1:]
+    rows, chains = [], []
+    base = dt.date(2026, 9, 1) + dt.timedelta(days=r.randint(0, 6))
+    for k in range(3):
+        text, noun, summ, comp = ev[k]
+        real, decoy, v_real, v_dec = tick(), tick(), ver(), ver()
+        date = base + dt.timedelta(days=4 * k + r.randint(0, 3))
+        ecode = code()
+        lp = f"logs/prod_serving_{date.isoformat()}.log"
+        ctx.text(lp).lines = _log_lines(r, f"serving-node-{r.randint(1, 12):02d}", u.fwslug, date, [
+            ("WARN", f"supervisor: {text.split(',')[0]}, retrying"), ("ERROR", f"{ecode}: {text}"),
+            ("INFO", f"incident logged against {real}")])
+        rows.append((real, comp, "S2", summ, "closed", v_real))
+        rows.append((decoy, comp, "S3", r.choice(decoy_tpl).format(N=cap(noun), n=noun), "closed", v_dec))
+        chains.append({"log": lp, "noun": noun, "real": real, "decoy": decoy, "v_real": v_real, "v_dec": v_dec})
+    text, noun, summ, comp = ev[7]                      # decoy-only event: a ticket exists, no log shows the incident
+    d_only, v_only = tick(), ver()
+    rows.append((d_only, comp, "S3", r.choice(decoy_tpl).format(N=cap(noun), n=noun), "closed", v_only))
+    bugs = GENERIC_BUGS[:]
+    r.shuffle(bugs)
+    for comp_g, summ_g in bugs[:6]:
+        rows.append((tick(), comp_g, r.choice(["S3", "S4"]), summ_g.format(v=u.ver_base), "closed",
+                     f"{int(major) - 1}.{r.randint(0, 5)}.{r.randint(0, 4)}"))
+    r.shuffle(rows)
+    cp = "support/incident_tickets.csv"
+    ctx.text(cp).lines = ["ticket,component,severity,summary,status,fixed_in"] + [",".join(x) for x in rows]
+    for c in chains:
+        ctx.q("T26", f"The production log shows a {c['noun']} incident. Which firmware release fixed the underlying defect?",
+              c["v_real"], [c["log"], cp], "multi-hop with topical decoy ticket, two citations required",
+              aliases=[f"{u.fw} {c['v_real']}"],
+              note=f"Chain: log -> {c['real']} -> incident_tickets.csv ({c['v_real']}). The csv also holds {c['decoy']}, whose "
+                   f"summary repeats the words '{c['noun']}' but is a different ticket (fixed in {c['v_dec']}); answering from it "
+                   "leaves the log out of the citations.")
+    ctx.q("T26", f"Which firmware version fixed ticket {chains[0]['decoy']}?", chains[0]["v_dec"], [cp],
+          "csv, single-hop (decoy ticket asked by id)", aliases=[f"{u.fw} {chains[0]['v_dec']}"],
+          note="Control: the decoy ticket is a real ticket and has its own fixed_in.")
+    ctx.cache["T26"] = {"noun_absent": noun, "csv": cp, "ticket_absent": d_only, "v_absent": v_only}
+
+
+def trap_T27(ctx: Ctx):
+    """Several incidents across several logs (different dates and services); one event recurs on two dates with
+    different codes, so the question must carry the date. Each log also has noise ERROR lines with other codes."""
+    u, r = ctx.u, ctx.xr("T27")
+    ev = _events(ctx)
+    a, b, c, never = ev[3], ev[4], ev[5], ev[6]
+    taken = {u.e6, u.e7, u.e_dec, u.nx_err}
+
+    def code():
+        while True:
+            x = f"E{r.randint(1000, 9999)}"
+            if x not in taken:
+                taken.add(x)
+                return x
+    generic = ["checksum mismatch on firmware slot 2", "NVMe write latency above 50 ms for 10 s",
+               "license server unreachable, grace period started", "TLS handshake failed with the fleet controller"]
+    dates = [dt.date(2026, 9, 8) + dt.timedelta(days=r.randint(0, 5))]
+    for _ in range(3):
+        dates.append(dates[-1] + dt.timedelta(days=r.randint(2, 5)))
+    svcs = ["chassisd", "powermgr", "fabricd", "railmon"]
+    got = []
+    for event, date, svc in zip((a, a, b, c), dates, svcs):
+        ecode = code()
+        specials = [("ERROR", f"{code()}: {g}") for g in r.sample(generic, 2)] + [("ERROR", f"{ecode}: {event[0]}")]
+        r.shuffle(specials)
+        path = f"logs/{svc}_{date.isoformat()}.log"
+        ctx.text(path).lines = _log_lines(r, f"{svc}-{r.randint(1, 9):02d}", svc, date, specials, n=20)
+        got.append((event, date, path, ecode))
+    for i, (event, date, path, ecode) in enumerate(got):
+        dated = i != 2                                   # the b event occurs once: no date needed
+        query = f"What error code is logged when the {event[1]} occurs" + (f" on {date.isoformat()}?" if dated else "?")
+        twin = dates[1 - i] if i < 2 else None
+        ctx.q("T27", query, ecode, [path],
+              "text log, same event in two service logs (date picks the file)" if i < 2 else "text log, one incident per service log",
+              note=f"One ERROR line in {path}; noise ERROR lines carry other codes." +
+                   (f" The same event is logged on {twin.isoformat()} with a different code." if twin else ""))
+    ctx.cache["T27"] = {"never": never[1], "b": b[1], "first": dates[0].isoformat(),
+                        "no_log": (dates[3] + dt.timedelta(days=3)).isoformat(), "a": a[1]}
+
+
+def trap_T28(ctx: Ctx):
+    """Datasheet PDF with the product family side by side (Parameter | lo | mid | hi) in padded fixed-pitch lines;
+    r1 (WITHDRAWN) carries different numbers in every numeric row. One cell is '-' (not applicable)."""
+    u, r = ctx.u, ctx.xr("T28")
+    lo, mid, hi = sorted(("p1", "p0", "p2"), key=lambda k: int(u.p[k].rsplit("-", 1)[1]))
+    prods = [u.p[lo], u.p[mid], u.p[hi]]
+    asc = lambda a, b, step=1: sorted(r.sample(range(a, b, step), 3))
+    num = [("Maximum junction temperature", asc(80, 112), lambda x: f"{x} C"),
+           ("Board power (TBP)", asc(250, 800, 5), lambda x: f"{x} W"),
+           ("Memory capacity", asc(32, 257, 8), lambda x: f"{x} GiB"),
+           ("Peak memory bandwidth", asc(15, 85), lambda x: f"{x / 10:.1f} TB/s"),
+           ("Typical acoustic noise", asc(30, 56), lambda x: f"{x} dB(A)")]
+    inlet = asc(30, 46)[:2]
+    aux = r.sample(["12V-2x6", "16-pin 12VHPWR", "8-pin EPS", "6-pin PCIe"], 3)
+
+    def cells_of(rev):
+        out = []
+        for name, vals, fmt in num:
+            if rev == 1:
+                vals = [x + r.choice([-9, -6, 6, 9]) if name != "Peak memory bandwidth" else x + r.choice([-6, 6]) for x in vals]
+            out.append((name, [fmt(x) for x in vals]))
+        out.append(("Maximum coolant inlet", ["-"] + [f"{x} C" for x in inlet]))
+        if rev == 2:
+            out.append(("Auxiliary power connector", aux))
+        return out
+
+    rule = r.random() < 0.5         # half of the seeds print a '-----' rule between the header and the rows
+
+    def table(rows):
+        head = f"{'Parameter':32}" + "".join(f"{p:<16}" for p in prods)
+        return [head.rstrip()] + (["-" * 80] if rule else []) + \
+            [(f"{n:32}" + "".join(f"{c:<16}" for c in cs)).rstrip() for n, cs in rows]
+    rows1, rows2 = cells_of(1), cells_of(2)
+    s = u.pre.lower()
+    r2p, r1p = f"specs/{s}_family_datasheet_r2.pdf", f"specs/{s}_family_datasheet_r1_WITHDRAWN.pdf"
+    title = f"{u.company} {u.pre}-series accelerators - family datasheet"
+    ctx.doc(r1p, "pdf").blocks = [("title", title), ("p", "Datasheet, revision 1 - WITHDRAWN, SUPERSEDED BY REVISION 2"),
+                                  ("p", "Preliminary silicon. Do not design to these numbers."), ("h", "Specifications")] + \
+        [("mono", ln) for ln in table(rows1)]
+    ctx.doc(r2p, "pdf").blocks = [("title", title), ("p", "Datasheet, revision 2 - supersedes revision 1"),
+                                  ("h", "Specifications")] + [("mono", ln) for ln in table(rows2)] + \
+        [("h", "Revision history"),
+         ("p", "r2  Re-characterised on production silicon; connector row added. Revision 1 is withdrawn."),
+         ("p", "r1  Initial release, preliminary silicon.")]
+    qnames = {"Maximum junction temperature": "maximum junction temperature", "Board power (TBP)": "board power",
+              "Memory capacity": "memory capacity, in GiB", "Peak memory bandwidth": "peak memory bandwidth, in TB/s",
+              "Auxiliary power connector": "auxiliary power connector"}
+    for ri, ci in [(0, 2), (1, 0), (2, 1), (3, 2), (6, 1)]:       # spread over rows and columns
+        name, cells = rows2[ri]
+        val = cells[ci]
+        number, _, unit = val.partition(" ")
+        if name == "Auxiliary power connector":
+            ans, al = val, []
+        else:
+            ans, al = number, ([f"{number} C", f"{number}°C", f"{number} degrees"] if unit == "C" else [val])
+        what, _, in_unit = qnames[name].partition(", ")
+        ctx.q("T28", f"What is the {what} of the {prods[ci]}" + (f", {in_unit}?" if in_unit else "?"), ans, [r2p],
+              "pdf, family table with the products side by side (pick the right column)", aliases=al,
+              note=f"Row '{name}': " + " | ".join(f"{p} = {c}" for p, c in zip(prods, cells))
+                   + (f". r1 (withdrawn) says {rows1[ri][1][ci]}." if ri < 5 else "."))
+    ctx.cache["T28"] = {"path": r2p, "lo": prods[0], "mid": prods[1], "hi": prods[2]}
+
+
+# ------------------------------------------------------------------ extra images (--n-images)
+
+_SIGNAL_POOL = ["GND", "SDA", "SCL", "PRSNT#", "CLK_P", "CLK_N", "3V3_AUX", "RESET#", "TX_EN", "RX_LOS", "WAKE#", "PERST#"]
+_COMPONENTS = ["power shelf", "midplane", "fan tray", "backplane", "management card", "switch module", "pump module"]
+
+
+def _scene(w: int, h: int, seed: int, base: int = 118, sigma: float = 11.0):
+    """Photo-like background: seeded gaussian noise (the `_bg_noise` layer) tinted to a bench/rack surface."""
+    from PIL import Image
+    n = _bg_noise(w, h, seed, sigma)
+    return Image.merge("RGB", (n.point(lambda v: min(255, int(v * base / 128) + 8)),
+                               n.point(lambda v: min(255, int(v * base / 128))),
+                               n.point(lambda v: min(255, int(v * (base - 6) / 128)))))
+
+
+def _card(w: int, h: int, lines: list, title: str, r: random.Random, size: int = 30):
+    """White card with a border, a title and (text, font size) lines."""
+    from PIL import Image, ImageDraw
+    c = Image.new("RGB", (w, h), "white")
+    d = ImageDraw.Draw(c)
+    d.rectangle((0, 0, w - 1, h - 1), outline="black", width=4)
+    d.text((26, 20), title, fill="black", font=_font(size + 2))
+    y = 20 + size + 34
+    for text, sz in lines:
+        d.text((26, y), text, fill="black", font=_font(sz))
+        y += sz + 22
+    return c
+
+
+def _on_scene(card, ctx_seed: int, angle: float, r: random.Random, blur: float = 0.0, noise: float = 0.0):
+    from PIL import Image, ImageFilter
+    import numpy as np
+    cr = card.convert("RGBA").rotate(angle, expand=True, resample=Image.BICUBIC)
+    W, H = cr.width + 160, cr.height + 140
+    bg = _scene(W, H, ctx_seed)
+    bg.paste(cr, ((W - cr.width) // 2, (H - cr.height) // 2), cr)
+    if blur:
+        bg = bg.filter(ImageFilter.GaussianBlur(blur))
+    if noise:
+        g = np.random.default_rng(ctx_seed + 1)
+        arr = np.asarray(bg).astype(np.float32) + g.normal(0, noise, (H, W, 1)).astype(np.float32)
+        bg = Image.fromarray(np.clip(arr, 0, 255).astype("uint8"), "RGB")
+    return bg
+
+
+def _pinout_img(r, title: str, pins: list, sigs: list, note: str):
+    from PIL import Image, ImageDraw
+    n = len(pins)
+    im = Image.new("RGB", (60 + 128 * n, 470), "white")
+    dr = ImageDraw.Draw(im)
+    dr.text((40, 24), title, fill="black", font=_font(30))
+    dr.rectangle((30, 80, im.width - 30, 330), outline="black", width=3)
+    for i, (pin, sg) in enumerate(zip(pins, sigs)):
+        x = 50 + 128 * i
+        dr.rectangle((x, 110, x + 108, 180), outline="black", width=2)
+        f = _font(28)
+        dr.text((x + 54 - dr.textlength(pin, font=f) / 2, 127), pin, fill="black", font=f)
+        dr.line((x + 54, 180, x + 54, 202), fill="black", width=2)
+        f = _font(15)
+        dr.text((x + 54 - dr.textlength(sg, font=f) / 2, 210 + (i % 2) * 24), sg, fill="black", font=f)
+    dr.text((40, 380), note, fill="black", font=_font(20))
+    return im
+
+
+def images_extra(ctx: Ctx, n: int):
+    """--n-images N: N png/jpg files that carry printed text only. The first 9 are 'answer' images (10 questions:
+    two refusals ask for a field the picture does not have); the rest are look-alikes of the same kinds with other
+    ids, sites, products and components, so nothing is retrievable by file name or by kind alone."""
+    u, r = ctx.u, ctx.xr("IMG")
+    prods = list(u.p.values())
+    used = set()
+
+    def uniq(draw):
+        while True:
+            x = draw()
+            if x not in used:
+                used.add(x)
+                return x
+    dirs = ["support/photos", "engineering/lab_photos", "planning/scans", "marketing/assets", "facilities/photos"]
+    counter = [0]
+
+    def put(img, ext, descriptive=None):
+        counter[0] += 1
+        name = descriptive or f"IMG_{uniq(lambda: r.randint(1000, 9999))}"
+        path = f"{dirs[counter[0] % len(dirs)]}/{name}.{ext}"
+        ctx.doc(path, ext).image = img
+        return path
+
+    def tok(prefix, lo=1000, hi=9999, suffix=""):
+        return uniq(lambda: f"{prefix}{r.randint(lo, hi)}{suffix}")
+    sites = SITES[:]
+    r.shuffle(sites)
+    comps = _COMPONENTS[:]
+    r.shuffle(comps)
+    p_print, p_plate = prods[2], prods[3]
+    # 1. shipping label (lot + PO)
+    site, lot, po = sites[0], f"L{r.randint(10, 99)}-{uniq(lambda: r.randint(1000, 9999))}", f"PO-{uniq(lambda: r.randint(10000, 99999))}"
+    card = _card(760, 400, [(f"SHIP TO   {site.upper()} LAB", 30), (f"LOT {lot}", 40), (f"REF {po}", 30),
+                            ("HANDLE WITH CARE - ESD SENSITIVE", 22)], "SHIPPING LABEL", r)
+    pth = put(_on_scene(card, ctx.seed + 11, r.choice([-3, 2, 90]), r, blur=0.5, noise=5), "jpg")
+    ctx.forbid += [lot, po]
+    ctx.q("IMG", f"What lot code is printed on the shipping label addressed to the {site} lab?", lot, [pth],
+          "jpg, shipping label among many look-alike photos", note="Lot appears in no text file.", imgonly=True)
+    ctx.q("IMG", f"Which purchase order reference is printed on the shipping label addressed to the {site} lab?", po, [pth],
+          "jpg, shipping label among many look-alike photos", note="Same picture as the lot question.", imgonly=True)
+    # 2. rack asset plate (photo-like)
+    rack = f"R{uniq(lambda: r.randint(1, 60))}"
+    plate = f"AP-{r.randint(1000, 9999)}-{r.choice('WXYZ')}"
+    card = _card(560, 230, [(f"RACK {rack}", 30), (plate, 44)], "ASSET PLATE", r, size=28)
+    pth = put(_on_scene(card, ctx.seed + 12, r.choice([-4, 3]), r, blur=0.9, noise=9), "jpg")
+    ctx.forbid.append(plate)
+    ctx.q("IMG", f"What asset plate id is on rack {rack} in the rack photos?", plate, [pth],
+          "jpg, noisy rack photo with a tilted plate", note="One of several rack-plate photos; the rack number selects it.",
+          imgonly=True)
+    # 3.+4. pinouts with near-duplicate signals
+    for k, (a_sig, b_sig, hdr) in enumerate([("FAN_TACH1", "FAN_TACH2", "management header"), ("PWR_OK_A", "PWR_OK_B", "power header")]):
+        jid = uniq(lambda: f"J{r.randint(10, 40)}")
+        L = r.choice("ABCDEFGH")
+        n0 = r.randint(1, 20)
+        pins = [f"{L}{n0 + i}" for i in range(8)]
+        others = r.sample([s for s in _SIGNAL_POOL], 6)
+        ia, ib = r.sample(range(8), 2)
+        it = iter(others)
+        sigs = [a_sig if i == ia else b_sig if i == ib else next(it) for i in range(8)]
+        im = _pinout_img(r, f"{prods[1 + k]} {jid} {hdr} - pin assignment", pins, sigs,
+                         f"{a_sig} and {b_sig} are separate signals. Levels are 3.3 V unless noted.")
+        pth = put(im, "png")
+        ctx.forbid += [pins[ia], pins[ib]]
+        ctx.q("IMG", f"Which pin of the {jid} {hdr} of the {prods[1 + k]} carries {b_sig}?", pins[ib], [pth],
+              "png, pinout with near-duplicate signal names", aliases=[f"pin {pins[ib]}"],
+              note=f"{a_sig} is on {pins[ia]} (the near-miss).", imgonly=True)
+        if k == 0:
+            absent = uniq(lambda: f"SPI_{r.choice('ABCD')}_CS#")
+            ctx.cache["IMG_pin"] = {"jid": jid, "hdr": hdr, "prod": prods[1], "absent": absent}
+    # 5. component nameplate (serial)
+    comp = comps[0]
+    ser = f"{u.code3[0]}{r.choice('QRSTWXZ')}{r.randint(1, 9)}-{r.randint(100000, 999999)}-{r.randint(10, 99)}"
+    card = _card(700, 330, [(f"MODEL   {p_plate}-{comp.split()[0][:2].upper()}", 28), (f"SERIAL   {ser}", 34),
+                            (f"MADE IN {u.made_in}", 24)], f"{comp.upper()} NAMEPLATE", r)
+    pth = put(_on_scene(card, ctx.seed + 13, -2, r, blur=0.4, noise=4), "jpg")
+    ctx.forbid.append(ser)
+    ctx.q("IMG", f"What serial number is printed on the nameplate of the {p_plate} {comp}?", ser, [pth],
+          "jpg, component nameplate", note="Look-alike nameplates exist for other components and products.", imgonly=True)
+    ctx.cache["IMG_name"] = {"prod": p_plate, "comp": comp}
+    # 6. BMC settings screenshot (numeric value)
+    floor = r.randrange(25, 66, 5)
+    img = _card(900, 420, [(f"Fan floor (percent)          {floor}", 30), (f"Power cap (W)                {r.randrange(300, 700, 25)}", 30),
+                           ("Boot order                   NVMe, PXE", 30), ("Telemetry export             enabled", 30)],
+                f"{prods[4]} BMC - thermal settings", r)
+    pth = put(img, "png")
+    ctx.q("IMG", f"What fan floor percentage is shown in the thermal settings screenshot of the {prods[4]} BMC?", str(floor), [pth],
+          "png, settings screenshot (numeric value only in the picture)", aliases=[f"{floor} percent", f"{floor}%"],
+          note="Short number: only the cited file's own text must not carry it.", imgonly=True)
+    # 7. test printout (measured value)
+    il = f"{r.randint(5, 39) / 10:.1f}"
+    img = _card(860, 380, [(f"Loopback test  {p_print}", 28), (f"Insertion loss (dB)      {il}", 32), ("Return loss (dB)         18.4", 28),
+                           ("Result                  PASS", 28)], "TEST PRINTOUT", r)
+    pth = put(_on_scene(img, ctx.seed + 14, 1.5, r, blur=0.3, noise=3), "jpg")
+    ctx.q("IMG", f"What insertion loss, in dB, is printed on the loopback test printout of the {p_print}?", il, [pth],
+          "jpg, test printout (numeric value only in the picture)", aliases=[f"{il} dB"], note="Return loss is 18.4 on every printout.",
+          imgonly=True)
+    # 8. spare-parts bin tag (location)
+    part = xpart(r, u, "SPR")
+    loc = f"{r.choice('ABCDEF')}-{r.randint(10, 29)}-{r.randint(1, 4)}"
+    img = _card(700, 300, [(part, 40), (f"BIN {loc}", 40), (f"QTY {r.randint(2, 40)}", 26)], "SPARES BIN TAG", r)
+    pth = put(_on_scene(img, ctx.seed + 15, 2, r, noise=4), "jpg")
+    ctx.forbid += [part, loc]
+    ctx.q("IMG", f"Which bin location is printed on the spares bin tag for part {part}?", loc, [pth],
+          "jpg, bin tag (part number and location only in the picture)", note="Look-alike bin tags carry other parts.",
+          imgonly=True)
+    # 9. console boot screen (version)
+    ver = f"{u.ver_base}.{r.randint(40, 79)}"
+    site_b = sites[1]
+    img = _card(900, 360, [(f"{u.fw} firmware {ver}", 34), (f"Node  {site_b.lower()}-ctl-{r.randint(1, 9):02d}", 28), ("Boot OK  all dies online", 28)],
+                "CONSOLE", r)
+    pth = put(_on_scene(img, ctx.seed + 16, -1, r, blur=0.4, noise=5), "jpg")
+    ctx.forbid.append(ver)
+    ctx.q("IMG", f"What firmware version does the boot screen photo of the {site_b} console show?", ver, [pth],
+          "jpg, console photo (version only in the picture)", aliases=[f"{u.fw} {ver}"], imgonly=True,
+          note="Look-alike boot screens show other sites.")
+    # refusals: the asked field is not in the (existing) picture
+    pc = ctx.cache["IMG_pin"]
+    ctx.q("IMG", f"Which pin of the {pc['jid']} {pc['hdr']} of the {pc['prod']} carries {pc['absent']}?", "", [],
+          "image refusal - the signal is not on the pinout", unanswerable=True,
+          note="The pinout lists eight signals; this one is not among them.")
+    ctx.q("IMG", f"What purchase order reference is printed on the nameplate of the {p_plate} {comp}?", "", [],
+          "image refusal - the nameplate has no such field", unanswerable=True,
+          note="The nameplate carries model, serial and origin only.")
+    ctx.q("IMG", f"What firmware version does the boot screen photo of the {sites[2]} console show?", "", [],
+          "image refusal - no boot screen photo for this site", unanswerable=True,
+          note="Boot screen photos exist for other sites only.")
+    # ---- look-alike fillers (no questions); never reuse an answered rack, site, jid, product-kind pair, part or component
+    kinds = ["return", "plate", "pinout", "nameplate", "printout", "bin", "boot", "photo"]
+    for i in range(max(0, n - counter[0])):
+        k = kinds[i % len(kinds)]
+        if k == "return":
+            card = _card(700, 340, [(f"FROM   {r.choice(sites[3:]).upper()} LAB", 28), (f"RMA {tok('RMA-', 10000, 99999)}", 36),
+                                    (f"CARTON {r.randint(1, 12)} OF {r.randint(12, 20)}", 26)], "RETURN TAG", r)
+            put(_on_scene(card, ctx.seed + 100 + i, r.choice([-3, 2, 90]), r, blur=0.5, noise=5), "jpg")
+        elif k == "plate":
+            card = _card(560, 230, [(f"RACK {tok('R', 61, 99)}", 30), (f"AP-{r.randint(1000, 9999)}-{r.choice('ABCD')}", 44)],
+                         "ASSET PLATE", r, size=28)
+            put(_on_scene(card, ctx.seed + 100 + i, r.choice([-4, 3]), r, blur=0.9, noise=9), "jpg")
+        elif k == "pinout":
+            L = r.choice("ABCDEFGH")
+            n0 = r.randint(1, 20)
+            sg = r.sample(_SIGNAL_POOL, 8)
+            put(_pinout_img(r, f"{r.choice(prods)} {tok('J', 41, 99)} debug header - pin assignment", [f"{L}{n0 + j}" for j in range(8)], sg,
+                            "Levels are 1.8 V unless noted."), "png")
+        elif k == "nameplate":
+            comp_f = comps[1 + i % (len(comps) - 1)]
+            pr = r.choice(prods)
+            card = _card(700, 330, [(f"MODEL   {pr}-{comp_f.split()[0][:2].upper()}", 28),
+                                    (f"SERIAL   {u.code3[0]}{r.choice('ABCDEFGH')}{r.randint(1, 9)}-{r.randint(100000, 999999)}-{r.randint(10, 99)}", 34),
+                                    (f"MADE IN {r.choice(['MALAYSIA', 'TAIWAN', 'VIETNAM', 'MEXICO'])}", 24)],
+                         f"{comp_f.upper()} NAMEPLATE", r)
+            put(_on_scene(card, ctx.seed + 100 + i, -2, r, blur=0.4, noise=4), "jpg")
+        elif k == "printout":
+            pr = r.choice([x for x in prods if x != p_print])
+            card = _card(860, 380, [(f"Loopback test  {pr}", 28), (f"Insertion loss (dB)      {r.randint(5, 39) / 10:.1f}", 32),
+                                    ("Return loss (dB)         18.4", 28), ("Result                  PASS", 28)], "TEST PRINTOUT", r)
+            put(_on_scene(card, ctx.seed + 100 + i, 1.5, r, blur=0.3, noise=3), "jpg")
+        elif k == "bin":
+            card = _card(700, 300, [(xpart(r, u, "SPR"), 40), (f"BIN {r.choice('ABCDEF')}-{r.randint(30, 49)}-{r.randint(1, 4)}", 40),
+                                    (f"QTY {r.randint(2, 40)}", 26)], "SPARES BIN TAG", r)
+            put(_on_scene(card, ctx.seed + 100 + i, 2, r, noise=4), "jpg")
+        elif k == "boot":
+            card = _card(900, 360, [(f"{u.fw} firmware {u.ver_base}.{r.randint(80, 99)}", 34),
+                                    (f"Node  {r.choice(sites[3:]).lower()}-ctl-{r.randint(1, 9):02d}", 28), ("Boot OK  all dies online", 28)],
+                         "CONSOLE", r)
+            put(_on_scene(card, ctx.seed + 100 + i, -1, r, blur=0.4, noise=5), "jpg")
+        else:                                   # a bare bench photo with a handwritten-style note
+            card = _card(520, 200, [(f"{r.choice(['checked', 'moved', 'swapped'])} {r.choice(['sled', 'cable', 'psu'])} {r.randint(1, 9)}", 30)],
+                         "BENCH NOTE", r, size=26)
+            put(_on_scene(card, ctx.seed + 100 + i, r.choice([-6, 5]), r, blur=0.8, noise=8), "jpg")
+
+
 # ------------------------------------------------------------------ v1 canaries
 
 def canaries_x(ctx: Ctx):
@@ -1991,6 +2534,24 @@ def canaries_x(ctx: Ctx):
          "refusal - the version is only a prefix-extension of real ones", f"Builds {c['T15b_ver'][1][0]}..{c['T15b_ver'][1][3]} exist; .100 does not.")),
         (("T15b",), "T15bc", lambda: (f"Which signal is on pin {c['T15b_pin'][0]}{c['T15b_pin'][1]}5 of the {p2} expansion connector?",
          "refusal - the pin does not exist (only a longer/shorter relative does)", "The connector table has no such pin.")),
+        (("T25",), "T25c", lambda: (f"What is the lead time, in weeks, of the {c['T25']['only'].lower()} for the {c['T25']['other_prod']}?",
+         "refusal - the component exists for a sibling product only (cross-sheet join finds no row)",
+         f"Parts lists the {c['T25']['only'].lower()} for the {c['T25']['only_prod']} only.")),
+        (("T25",), "T25c", lambda: (f"What is the unit cost in USD of the {c['T25']['ccomp'].lower()} for the {c['T25']['cprod']} at 10,000 unit volume?",
+         "refusal - the quantity break is not in the Costs sheet", "Costs has breaks at 100, 1000 and 5000 only.")),
+        (("T26",), "T26c", lambda: (f"The production log shows a {c['T26']['noun_absent']} incident. Which firmware release fixed the underlying defect?",
+         "refusal - only a topical ticket exists (support/incident_tickets.csv); no log shows the incident",
+         f"{c['T26']['ticket_absent']} ({c['T26']['v_absent']}) mentions the topic but is not the defect behind any logged incident.")),
+        (("T27",), "T27c", lambda: (f"What error code is logged when the {c['T27']['never']} occurs?",
+         "refusal - the event never occurs in any of the service logs", "No ERROR line describes it.")),
+        (("T27",), "T27c", lambda: (f"What error code is logged when the {c['T27']['b']} occurs on {c['T27']['first']}?",
+         "refusal - the event occurs, but not in the log of that date", "It is logged once, on another date.")),
+        (("T27",), "T27c", lambda: (f"What error code is logged when the {c['T27']['a']} occurs on {c['T27']['no_log']}?",
+         "refusal - no service log exists for that date", "The logs cover other dates.")),
+        (("T28",), "T28c", lambda: (f"What is the maximum coolant inlet temperature of the {c['T28']['lo']}?",
+         "refusal - the table cell is '-' (not applicable) for this product", "Only the larger products list an inlet limit.")),
+        (("T28",), "T28c", lambda: (f"What is the board power of the {u.nx_product} according to the {u.pre}-series family datasheet?",
+         "refusal - false premise (the product does not exist)", f"The family table has no {u.nx_product} column.")),
         (("T21",), "T21c", lambda: (f"What is the maximum number of racks permitted at the {[s for s in SITES if s != c['T21']['site']][0]} lab?",
          "refusal - the site survey is for a different site", f"The only survey in the corpus is for {c['T21']['site']}.")),
     ]
@@ -2180,13 +2741,37 @@ def fillers(ctx: Ctx, forbidden: list[re.Pattern]):
 
 # ------------------------------------------------------------------ build + validation
 
-def build(seed: int, attempt: int, traps: list[str], n_files: int) -> Ctx:
-    ctx = Ctx(seed, attempt, traps, n_files)
+def cap_refusals(ctx: Ctx, keep: int):
+    """Keep only `keep` of the refusal questions, round-robin over the trap tags (small suites with a few canaries)."""
+    rng = ctx.xr("CAP")
+    refs = [q for q in ctx.queries if q["unanswerable"]]
+    by_tag: dict = {}
+    for q in refs:
+        by_tag.setdefault(q["trap"], []).append(q)
+    for v in by_tag.values():
+        rng.shuffle(v)
+    tags = sorted(by_tag)
+    rng.shuffle(tags)
+    chosen = []
+    while len(chosen) < keep and any(by_tag.values()):
+        for t in tags:
+            if by_tag[t] and len(chosen) < keep:
+                chosen.append(by_tag[t].pop())
+    drop = {id(q) for q in refs} - {id(q) for q in chosen}
+    ctx.queries = [q for q in ctx.queries if id(q) not in drop]
+
+
+def build(seed: int, attempt: int, traps: list[str], n_files: int, n_images: int = 0, max_refusals: int | None = None) -> Ctx:
+    ctx = Ctx(seed, attempt, traps, n_files, n_images)
     vendor_files(ctx)
     for t in traps:
         globals()[f"trap_{t}"](ctx)
     canaries(ctx)
     canaries_x(ctx)
+    if n_images:
+        images_extra(ctx, n_images)
+    if max_refusals is not None:
+        cap_refusals(ctx, max_refusals)
     u = ctx.u
     forbidden = [bound_re(x) for x in (u.nx_product, *u.nx_tickets, u.nx_dev, u.nx_err, u.v6, u.v7, u.t6, u.t7,
                                        u.e6, u.e7, u.pin, u.rev, u.serial, u.fcc, u.q_tapeout, *ctx.forbid,
@@ -2308,17 +2893,28 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--n-files", type=int, default=40)
-    ap.add_argument("--traps", default=",".join(TRAPS), help="comma list, default all: " + ",".join(TRAPS))
+    ap.add_argument("--max-refusals", type=int, default=None,
+                    help="keep only N of the refusal (canary) questions, spread over the trap tags; default: all")
+    ap.add_argument("--n-images", type=int, default=0,
+                    help="add N png/jpg files with printed text (>= 9: 9 answer images with 10 questions + 3 refusals, the "
+                         "rest look-alike fillers); counted in --n-files; default 0 = none, seeds stay reproducible")
+    ap.add_argument("--traps", default=",".join(TRAPS),
+                    help="comma list, default all: " + ",".join(TRAPS) + "; opt-in only (never in the default): "
+                    + ",".join(EXTRA_TRAPS))
     a = ap.parse_args(argv)
-    canon = {x.upper(): x for x in TRAPS}
+    canon = {x.upper(): x for x in TRAPS + EXTRA_TRAPS}
     traps = [canon.get(t.strip().upper(), t.strip()) for t in a.traps.split(",") if t.strip()]
-    unknown = [t for t in traps if t not in TRAPS]
+    unknown = [t for t in traps if t not in TRAPS + EXTRA_TRAPS]
     if unknown:
         ap.error(f"unknown traps: {unknown}")
+    for t, others in TRAP_CONFLICTS.items():
+        clash = [o for o in others if t in traps and o in traps]
+        if clash:
+            ap.error(f"{t} cannot be combined with {clash} (same attributes, different values)")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     for attempt in range(50):
-        ctx = build(a.seed, attempt, traps, a.n_files)
+        ctx = build(a.seed, attempt, traps, a.n_files, a.n_images, a.max_refusals)
         bad = validate(ctx)
         if not bad:
             break

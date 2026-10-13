@@ -1,0 +1,26 @@
+[
+ {
+  "name": "v5_gblog",
+  "env": {
+   "MC3_GATE_B": "log"
+  }
+ },
+ {
+  "name": "rank_cov",
+  "env": {
+   "MC3_RANK": "cov_first"
+  }
+ },
+ {
+  "name": "chain",
+  "env": {
+   "MC3_CHAIN_GUARD": "1"
+  }
+ },
+ {
+  "name": "join",
+  "env": {
+   "MC3_XLSX_JOIN": "1"
+  }
+ }
+]

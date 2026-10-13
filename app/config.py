@@ -64,9 +64,22 @@ OCR_THREADS = _i("MC3_OCR_THREADS", 4)
 OCR_MIN_CONF = _f("MC3_OCR_MIN_CONF", 0.85)
 
 # gates
-GATE_B = os.environ.get("MC3_GATE_B", "0") == "1"
+GATE_B_MODE = os.environ.get("MC3_GATE_B", "0")    # "0" off | "log" compute + record, never refuse | "1" enforce
+GATE_B = GATE_B_MODE == "1"
 GATE_B_THETA1 = _f("MC3_GATE_B_T1", -0.7)
 GATE_B_THETA2 = _f("MC3_GATE_B_T2", 2.0)
+
+# hypothesis flags (A/B against v5; every default reproduces v5 exactly). Always read as config.X at call time.
+XLSX_JOIN = os.environ.get("MC3_XLSX_JOIN", "0") == "1"      # H1: cross-sheet join records + cross-sheet formula refs
+PDF_COLS = os.environ.get("MC3_PDF_COLS", "0") == "1"        # H5: per-product records from PDF family tables
+RANK = os.environ.get("MC3_RANK", "default")                 # H4: "cov_first" = coverage before hop target
+CHAIN_GUARD = os.environ.get("MC3_CHAIN_GUARD", "0") == "1"  # H2: named-kind chain guard against topical decoys
+LABEL_STRIP = os.environ.get("MC3_LABEL_STRIP", "0") == "1"  # H7: drop a printed field label the question names
+DATE_COND = os.environ.get("MC3_DATE_COND", "0") == "1"      # H8: a date in the question must appear in the support record or its path
+
+# H6: model "warrant" check after the verified answer (YES/NO question to the reader). Read as config.X at call time.
+WARRANT = os.environ.get("MC3_WARRANT", "0")         # "0" off | "log" compute + record, never refuse | "1" enforce
+WARRANT_THETA = _f("MC3_WARRANT_T", 0.0)             # refuse when log P(YES) - log P(NO) < theta
 
 # confidence values reported (never scored)
 CONF_SINGLE = 0.9

@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import logging
 import re
+import time
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +15,8 @@ from pathlib import Path
 import config
 import textnorm
 from schema import FileEntry, Record
+
+log = logging.getLogger("mc3.index")
 
 _PRODUCT_RE = re.compile(r"^[A-Z]{1,4}-?\d{1,4}[A-Z]?$", re.I)
 _REV_TOKEN_RE = re.compile(r"(?:^|[_\-\s])(?:r|rev|v)\d+[a-z]?(?=[_\-\s]|$)", re.I)
@@ -191,6 +195,176 @@ class Index:
         return list(dict.fromkeys(out))
 
 
+# ---------------------------------------------------------------- derived records (config flags)
+
+_SHEET_ROW_RE = re.compile(r"^(.+)!R\d+$")
+_SHEET_HEADER_RE = re.compile(r"\[sheet [^\]]*\]\s*columns:", re.I)
+JOIN_CAP = 500            # join records per workbook
+_JOIN_PER_ROW = 4         # other-sheet rows joined to one row
+_PDF_LOC_RE = re.compile(r"^p(\d+)\.L(\d+)$")
+COL_MAX_ROWS = 40         # table rows split per header
+COL_MAX_PRODUCTS = 12     # products in a header
+COL_MAX_RECORDS = 5000    # col records per file
+JOIN_MAX_BUCKET = 200     # rows sharing one join key; a bigger bucket is a category, not a key
+DERIVED_BUDGET_S = 3.0    # wall time per file for derived records; over it the file gets none
+COL_MAX_CELL = 40         # chars of a text cell in a column-aligned row
+_RULE_RE = re.compile(r"[\s\-=_|─━—–]*[\-=_─━—–]{3}[\s\-=_|─━—–]*")   # "-----", "===", "---|---"
+# a value cell of a family table: number with an optional (glued or spaced) unit, or an empty-cell dash
+_COL_CELL = r"(?:[+-]?\d[\d,]*(?:\.\d+)?(?:\s?[A-Za-z%°µΩ]{1,4}(?:/[A-Za-z]{1,4})?)?|—|–|-|n/a)"
+_COL_DASHES = {"—", "–", "-", "n/a"}
+_COL_ROW_RES: dict[int, re.Pattern] = {}
+
+
+class _DerivedTimeout(Exception):
+    pass
+
+
+def _tick(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() > deadline:
+        raise _DerivedTimeout()
+
+
+def _is_product(tok: str) -> bool:
+    return bool(_PRODUCT_RE.match(tok))
+
+
+def _join_keys(text: str) -> set[str]:
+    """Identifier tokens (nid) a row can be joined on: codes with a letter, not products or decimals."""
+    out = set()
+    for raw in textnorm.ids(text):
+        if (not _indexable(raw) or _VERSION_ID_RE.fullmatch(raw) or _is_product(raw)
+                or not any(c.isalpha() for c in raw)):
+            continue
+        out.add(textnorm.nid(raw))
+    return out
+
+
+def _join_records(recs: list[dict], deadline: float | None = None) -> list[tuple[str, str, bool]]:
+    """Derived rows of one workbook: row R of sheet B + row S of another sheet A of the same workbook when
+    they share an identifier and S names a product that R does not. Returns (loc, text, stale)."""
+    rows = []   # (sheet, rec, keys, products)
+    for n, r in enumerate(recs):
+        if n % 256 == 0:
+            _tick(deadline)
+        m = _SHEET_ROW_RE.match(r["loc"])
+        if not m or _SHEET_HEADER_RE.match(r["text"]):
+            continue
+        keys = _join_keys(r["text"])
+        if keys:
+            prods = {textnorm.nid(x) for x in textnorm.ids(r["text"]) if _is_product(x)}
+            rows.append((m.group(1), r, keys, prods))
+    by_key: dict[str, list[int]] = {}
+    for i, (_, _, keys, _) in enumerate(rows):
+        for k in keys:
+            by_key.setdefault(k, []).append(i)
+    by_key = {k: v for k, v in by_key.items() if len(v) <= JOIN_MAX_BUCKET}
+    out = []
+    for i, (sheet, r, keys, prods) in enumerate(rows):
+        if i % 64 == 0:
+            _tick(deadline)
+        done: set[int] = set()
+        full = False
+        for k in sorted(keys):
+            for j in by_key.get(k, ()):
+                s_sheet, s, _, s_prods = rows[j]
+                if s_sheet == sheet or j in done or not (s_prods - prods):
+                    continue
+                if len(done) >= _JOIN_PER_ROW:
+                    full = True
+                    break
+                done.add(j)
+                out.append((f"{r['loc']}~{s['loc']}", f"[join] {r['text']} || {s['text']}",
+                            bool(r.get("stale")) or bool(s.get("stale"))))
+                if len(out) >= JOIN_CAP:
+                    return out
+            if full:
+                break
+    return out
+
+
+def _col_header(text: str) -> list[str] | None:
+    """Product IDs closing a header line ("Parameter   TQ-20   TQ-40   TQ-60"), when there are >= 2."""
+    toks = text.replace("|", " ").split()
+    prods: list[str] = []
+    while toks:
+        t = textnorm.fold_dashes(toks[-1]).strip(",;")
+        if not (_is_product(t) and ("-" in t or re.match(r"[A-Za-z]{2}", t))):
+            break
+        prods.insert(0, t)
+        toks.pop()
+    if not 2 <= len(prods) <= COL_MAX_PRODUCTS or len({textnorm.nid(p) for p in prods}) != len(prods):
+        return None
+    if len(toks) > 4 or any(c.isdigit() for t in toks for c in t):
+        return None
+    return prods
+
+
+def _col_row(text: str, k: int) -> tuple[str, list[str]] | None:
+    """(label, k values) of a table row that ends in exactly k value cells, else None."""
+    t = text.strip()
+    parts = re.split(r"\s{2,}|\t", t)
+    if len(parts) == k + 1 and all(p.strip() and len(p.strip()) <= COL_MAX_CELL for p in parts[1:]):
+        # column-aligned row (2+ space gutters): text cells too ("6-pin PCIe", "55 dB(A)")
+        label, vals = parts[0], [p.strip() for p in parts[1:]]
+    else:
+        rx = _COL_ROW_RES.get(k)
+        if rx is None:
+            rx = _COL_ROW_RES[k] = re.compile(r"(.*\S)\s+" + r"\s+".join([f"({_COL_CELL})"] * k), re.I)
+        m = rx.fullmatch(t)
+        if not m:
+            return None
+        label, vals = m.group(1), list(m.groups()[1:])
+    label = re.sub(r"\s+", " ", label).strip()
+    if not any(c.isalpha() for c in label) or all(v.lower() in _COL_DASHES for v in vals):
+        return None
+    return label, vals
+
+
+def _col_records(recs: list[dict], deadline: float | None = None) -> list[tuple[str, str, bool]]:
+    """Per-product rows of PDF family tables: a header naming k >= 2 products, then consecutive lines ending
+    in k values ("Max junction temperature 85 94 105") -> "[col] TQ-40: Max junction temperature 94"."""
+    out = []
+    hdr = None   # [page, last_line, products, rows]
+    for n, r in enumerate(recs):
+        if n % 64 == 0:
+            _tick(deadline)
+        m = _PDF_LOC_RE.match(r["loc"])
+        if not m:
+            hdr = None
+            continue
+        page, line = int(m.group(1)), int(m.group(2))
+        if hdr:
+            if page == hdr[0] and line == hdr[1] + 1 and _RULE_RE.fullmatch(r["text"].strip()):
+                hdr[1] += 1      # a ruled line is neither data nor the end of the table
+                continue
+            if page == hdr[0] and line == hdr[1] + 1 and hdr[3] < COL_MAX_ROWS:
+                row = _col_row(r["text"], len(hdr[2]))
+                if row:
+                    for prod, val in zip(hdr[2], row[1]):
+                        if val.lower() not in _COL_DASHES:
+                            out.append((f"{r['loc']}#{prod}", f"[col] {prod}: {row[0]} {val}",
+                                        bool(r.get("stale"))))
+                    hdr[1] += 1
+                    hdr[3] += 1
+                    if len(out) >= COL_MAX_RECORDS:
+                        return out[:COL_MAX_RECORDS]
+                    continue
+            hdr = None
+        prods = _col_header(r["text"])
+        if prods:
+            hdr = [page, line, prods, 0]
+    return out
+
+
+def _derived(path: str, recs: list[dict], fn) -> list[tuple[str, str, bool]]:
+    """Derived records of one file; any failure or an overrun of DERIVED_BUDGET_S gives none (v5 behaviour)."""
+    try:
+        return fn(recs, time.monotonic() + DERIVED_BUDGET_S)
+    except Exception as e:   # noqa: BLE001 - derived records are optional
+        log.warning("derived records skipped for %s: %s", path, type(e).__name__)
+        return []
+
+
 def build(parsed: list[dict], ocr: dict[str, dict] | None = None) -> Index:
     """Index from parse.walk output and optional OCR results {file: {"lines": [...], "pairs": [...]}}."""
     ocr = ocr or {}
@@ -212,6 +386,12 @@ def build(parsed: list[dict], ocr: dict[str, dict] | None = None) -> Index:
                     add(d["path"], f"ocr.L{i}", str(line), "ocr")
             if o.get("pairs"):
                 add(d["path"], "ocr.pairs", "; ".join(str(p) for p in o["pairs"]), "ocr")
+        if d["status"] == "ok" and d["kind"] == "xlsx" and config.XLSX_JOIN:
+            for loc, text, stale in _derived(d["path"], d["records"], _join_records):
+                add(d["path"], loc, text, "join", stale=stale)
+        if d["status"] == "ok" and d["kind"] == "pdf" and config.PDF_COLS:
+            for loc, text, stale in _derived(d["path"], d["records"], _col_records):
+                add(d["path"], loc, text, "col", stale=stale)
         fl = d.get("flags", {})
         n_prod = {textnorm.nid(x) for x in textnorm.ids(d.get("text", "")) if _PRODUCT_RE.match(x)}
         files.append(FileEntry(

@@ -26,6 +26,8 @@ crane append -b "$REF:heavy-noapp" -f "$WORK/20-app.tar" -t "$REF:$TAG"
 crane mutate "$REF:$TAG" --cmd python3,/app/server.py --workdir /app \
   --env MC3_MODEL=/models/Qwen3-VL-8B-Instruct --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 \
   --env PYTHONUNBUFFERED=1 --env TOKENIZERS_PARALLELISM=false --env OMP_NUM_THREADS=8 \
+  --env MC3_XLSX_JOIN=1 --env MC3_PDF_COLS=1 --env MC3_LABEL_STRIP=1 --env MC3_CHAIN_GUARD=1 \
+  --env MC3_WARRANT=1 --env MC3_WARRANT_T=-6 \
   -t "$REF:$TAG"
 crane config "$REF:$TAG" | jq .config
 echo "pushed $REF:$TAG  digest: $(crane digest "$REF:$TAG")"

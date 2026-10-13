@@ -74,11 +74,23 @@ def run(corpus: Path, questions: Path, out: Path, reader_kind: str = "oracle", m
     t_index = time.time() - t0
     if verbose:
         print(f"indexed {len(idx.files)} files, {len(idx.records)} records in {t_index:.1f}s")
+    return run_questions(corpus, questions, data, out, reader, idx, t_index, reader_kind, soft, verbose)
 
+
+def run_questions(corpus: Path, questions: Path, data: dict, out: Path, reader, idx, t_index: float,
+                  reader_kind: str = "oracle", soft: float = 22.0, verbose: bool = True,
+                  extra_seconds=None, on_question=None) -> dict:
+    """Answer ``data["queries"]`` with an already built reader and index, write OUT/query_NN_output.json and
+    OUT/report.json. ``extra_seconds()`` (optional) returns a cumulative counter of seconds a caching reader
+    saved; the per-question delta is reported as ``seconds_est`` (= seconds + saved) next to the wall-clock
+    ``seconds`` (and ``p50_est``/``p95_est``/``max_est``). ``on_question(qid, per_q_row)`` is a progress hook."""
+    corpus, out = Path(corpus), Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     per_q = {}
     for q in data["queries"]:
         qid = f"query_{q['n']:02d}"
         trace = Trace()
+        saved0 = extra_seconds() if extra_seconds else 0.0
         t = time.time()
         res = pipeline.answer(idx, reader, q["query"], Deadline.after(soft), corpus, trace)
         secs = time.time() - t
@@ -89,6 +101,10 @@ def run(corpus: Path, questions: Path, out: Path, reader_kind: str = "oracle", m
                       "support_rid": res.trace.get("support_rid"),
                       "notes": res.trace.get("notes", {}),
                       "stages": res.trace.get("stages", [])}
+        if extra_seconds:
+            per_q[qid]["seconds_est"] = round(secs + extra_seconds() - saved0, 3)
+        if on_question:
+            on_question(qid, per_q[qid])
 
     sc = score_mod.score(data, out)
     by_n = {q["n"]: q for q in data["queries"]}
@@ -111,6 +127,10 @@ def run(corpus: Path, questions: Path, out: Path, reader_kind: str = "oracle", m
                     "max": round(max(secs), 3) if secs else 0.0},
         "rows": [dict(r, **per_q[r["id"]], category=r["category"]) for r in sc["rows"]],
     }
+    if extra_seconds:
+        est = [v["seconds_est"] for v in per_q.values()]
+        report["seconds"].update({"p50_est": round(pct(est, 50), 3), "p95_est": round(pct(est, 95), 3),
+                                  "max_est": round(max(est), 3) if est else 0.0})
     (out / "report.json").write_text(json.dumps(report, indent=1, ensure_ascii=False), encoding="utf-8")
     if verbose:
         print_report(report)

@@ -12,10 +12,16 @@ Phases (MC3_PHASE, comma list, run in the order given; `all` = setup,weights,ben
   bench    gpu/bench.py -> /content/mc3/runs/<ts>/<model_slug>/bench.json
   suite    eval/run_suite.py on sample-corpus, then on every eval/suites/*/ that has questions.json
            -> /content/mc3/runs/<ts>/<model_slug>/<suite>/
+  ab       eval/ab_suite.py (NOT part of `all`): several hypothesis configs vs a baseline in one process, the model
+           loaded once and reader calls memoised in /content/mc3/cache -> <current run>/ab/ (ab_summary.json + table).
+           MC3_SUITES=comma list; MC3_AB_CONFIGS=JSON list of {"name","env"} or a path relative to src (the first
+           config is the baseline); MC3_AB_GROUPS='TUNE=sample,s1;HOLDOUT=h101' (optional); MC3_AB_SOFT / MC3_AB_LIMIT
   report   merge every JSON of the current run -> one table per model + /content/mc3/runs/latest.json
 Other env: MC3_UPDATE=1 re-untar src.tar first; MC3_NEW_RUN=1 start a new runs/<ts> (both one-shot); MC3_RUN=<ts> pin the run;
 MC3_SUITES=sample,s1,s2,s3,s4 restrict suites ("sample" = sample-corpus); MC3_BENCH_SUITE=1 let bench run the suite too;
 MC3_BASE (default /content/mc3); MC3_SKIP_PIP=1.
+A/B example:  colab exec -s mc3-gpu --timeout 7200 --env MC3_PHASE=ab --env MC3_SUITES=sample,s1,s2 \\
+                  --env MC3_AB_CONFIGS=eval/ab_configs.json --env 'MC3_AB_GROUPS=TUNE=sample,s1;HOLDOUT=s2' -f gpu/colab_gpu.py
 
 A/B of another VLM (the default stays Qwen3-VL-8B): every exec that touches the model (weights, bench, suite)
 must name it, because the three variables below are one-shot -- they are removed from the kernel environment when the
@@ -404,6 +410,62 @@ def phase_suite() -> bool:
     return ok_all
 
 
+def ab_configs_arg() -> str | None:
+    """MC3_AB_CONFIGS: an inline JSON string, or a path (relative to SRC, or absolute) to a JSON file."""
+    raw = os.environ.get("MC3_AB_CONFIGS", "").strip()
+    if not raw:
+        return None
+    if raw.startswith(("[", "{")):
+        return raw
+    p = Path(raw)
+    return str(p if p.is_absolute() else SRC / p)
+
+
+def phase_ab() -> bool:
+    """eval/ab_suite.py: one model load, many configs, shared reader cache; prints the summary table."""
+    banner("ab")
+    if (why := _need_ready()):
+        say(f"[ab] SKIP: {why}")
+        return False
+    if not (SRC / "eval" / "ab_suite.py").exists():
+        say("[ab] SKIP: eval/ab_suite.py not in src.tar")
+        return False
+    configs = ab_configs_arg()
+    if configs is None:
+        say("[ab] SKIP: set MC3_AB_CONFIGS (JSON list of {name, env} or a path relative to src)")
+        return False
+    if not configs.lstrip().startswith(("[", "{")) and not Path(configs).exists():
+        say(f"[ab] SKIP: MC3_AB_CONFIGS file {configs} not found")
+        return False
+    suites = [s.strip() for s in os.environ.get("MC3_SUITES", "").split(",") if s.strip()]
+    if not suites:
+        suites = [name for name, _, _ in suite_list()]
+    run = current_run(create=True)
+    out = run / "ab"
+    out.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "eval/ab_suite.py", "--suites", ",".join(suites), "--configs", configs,
+           "--reader", "real", "--model", str(MODEL_DIR), "--out", str(out), "--cache", str(BASE / "cache")]
+    for g in (x.strip() for x in os.environ.get("MC3_AB_GROUPS", "").split(";")):
+        if g:
+            cmd += ["--group", g]
+    for var, flag in (("MC3_AB_SOFT", "--soft"), ("MC3_AB_LIMIT", "--limit")):
+        if os.environ.get(var, "").strip():
+            cmd += [flag, os.environ[var].strip()]
+    say(f"[ab] suites={suites} -> {out}")
+    rc, _ = sh(cmd, cwd=SRC, log=out / "ab_stdout.txt")
+    summ = out / "ab_summary.json"
+    try:   # the child printed the table last; show it again after the (long) progress log
+        lines = (out / "ab_stdout.txt").read_text(errors="replace").splitlines()
+        start = max((i for i, l in enumerate(lines) if l.startswith("A/B summary")), default=None)
+        if start is not None:
+            say("\n" + "=" * 8 + " ab summary " + "=" * 8)
+            say("\n".join(lines[start:]))
+    except OSError as e:
+        say(f"[ab] could not re-print the table: {e!r}")
+    say(f"[ab] rc={rc} -> {summ}   download: colab download -s mc3-gpu {summ}")
+    return rc == 0
+
+
 def phase_harness() -> bool:
     """Real server.py (supervisor + child, real model) + app.py subprocesses per question, like the harness."""
     banner("harness")
@@ -577,7 +639,7 @@ def phase_report() -> bool:
 
 
 PHASES = {"setup": phase_setup, "weights": phase_weights, "bench": phase_bench, "suite": phase_suite,
-          "harness": phase_harness,
+          "harness": phase_harness, "ab": phase_ab,
           "report": phase_report}
 
 
@@ -600,7 +662,7 @@ def main() -> int:
     if update:
         banner("update (MC3_UPDATE=1)")
         extract_src(force=True)
-    if new_run and any(p in ("bench", "suite") for p in wanted):
+    if new_run and any(p in ("bench", "suite", "ab") for p in wanted):
         (RUNS).mkdir(parents=True, exist_ok=True)
         (RUNS / "CURRENT").write_text(time.strftime("%Y%m%d-%H%M%S"))
         (RUNS / (RUNS / "CURRENT").read_text()).mkdir(parents=True, exist_ok=True)

@@ -262,6 +262,7 @@ def _pptx(p: Path) -> tuple[list, list]:
 # ---------------------------------------------------------------- spreadsheets
 
 _REF = re.compile(r"(?:(?:'[^']+'|[A-Za-z_][\w. ]*)!)?\$?([A-Z]{1,3})\$?(\d+)(?::\$?([A-Z]{1,3})\$?(\d+))?")
+_REF_SHEET = re.compile(r"(?:(?P<sheet>'(?:[^']|'')+'|[A-Za-z_][\w.]*)!)?\$?([A-Z]{1,3})\$?(\d+)(?::\$?([A-Z]{1,3})\$?(\d+))?")
 _FUNCS = {"SUM": lambda *a: sum(_flat(a)), "MIN": lambda *a: min(_flat(a)),
           "MAX": lambda *a: max(_flat(a)), "AVERAGE": lambda *a: sum(_flat(a)) / len(_flat(a)),
           "ROUND": lambda x, n=0: round(x, int(n)), "ABS": abs}
@@ -274,28 +275,44 @@ def _flat(a):
     return [x for x in out if isinstance(x, (int, float))]
 
 
-def _eval_formula(formula: str, ws_values) -> float | None:
+def _eval_formula(formula: str, ws_values, sheets: dict | None = None, cur: str | None = None,
+                  unresolved: set | None = None) -> float | None:
     """Tiny, whitelisted evaluator for arithmetic/SUM-style formulas whose cached
-    value is missing (files written by openpyxl carry no cached results)."""
+    value is missing (files written by openpyxl carry no cached results).
+
+    ``sheets`` ({lower-cased title: grid}, set only with config.XLSX_JOIN) resolves ``Sheet!B3`` references
+    against the referenced sheet; without it every reference is read from ``ws_values`` (the current sheet).
+    ``unresolved`` ({(sheet, row, col)}, needs ``cur`` = the current sheet's lower-cased title) holds formula
+    cells without a value yet: reading one makes the whole formula unresolved (None), never 0."""
     from openpyxl.utils import column_index_from_string as col
 
-    def cell(c, r):
-        v = ws_values.get((int(r), col(c)))
+    def cell(c, r, grid=ws_values, name=cur):
+        if unresolved and (name, int(r), col(c)) in unresolved:
+            raise ValueError("references an unresolved formula")
+        v = grid.get((int(r), col(c)))
         return v if isinstance(v, (int, float)) else 0
 
     def repl(m):
-        c1, r1, c2, r2 = m.groups()
+        c1, r1, c2, r2 = m.groups()[-4:]
+        grid, name = ws_values, cur
+        if sheets is not None and m.group("sheet") is not None:
+            name = m.group("sheet")
+            name = name[1:-1].replace("''", "'") if name.startswith("'") else name
+            name = name.lower()
+            grid = sheets.get(name)
+            if grid is None:
+                raise ValueError("unknown sheet")
         if c2:
             if (int(r2) - int(r1) + 1) * (col(c2) - col(c1) + 1) > XLSX_MAX_MERGE_CELLS:
                 raise ValueError("range too large")
-            return "[" + ",".join(repr(cell(get_col(ci), ri))
+            return "[" + ",".join(repr(cell(get_col(ci), ri, grid, name))
                                   for ri in range(int(r1), int(r2) + 1)
                                   for ci in range(col(c1), col(c2) + 1)) + "]"
-        return repr(cell(c1, r1))
+        return repr(cell(c1, r1, grid, name))
 
     from openpyxl.utils import get_column_letter as get_col
     try:
-        expr = _REF.sub(repl, formula.lstrip("=")).replace("^", "**")
+        expr = (_REF if sheets is None else _REF_SHEET).sub(repl, formula.lstrip("=")).replace("^", "**")
         tree = ast.parse(expr, mode="eval")
     except (SyntaxError, ValueError, MemoryError, RecursionError):
         return None
@@ -338,30 +355,73 @@ def _rows_of(ws):
     return ws.iter_rows(max_row=min(ws.max_row or 1, XLSX_MAX_ROWS), max_col=min(ws.max_column or 1, XLSX_MAX_COLS))
 
 
+def _fill_formulas(wb_f, grids: dict[str, dict]) -> None:
+    """config.XLSX_JOIN: results for formula cells without a cached value, across sheets, in up to 3 passes.
+    A formula that reads a formula cell still unresolved stays without a value (never 0)."""
+    pending = []   # (sheet key, row, col, formula)
+    for ws in wb_f.worksheets:
+        key = ws.title.lower()
+        grid = grids.get(key)
+        if grid is None:
+            continue
+        for row in _rows_of(ws):
+            for c in row:
+                if isinstance(c.value, str) and c.value.startswith("=") and \
+                        grid.get((c.row, c.column)) in (None, c.value):
+                    pending.append((key, c.row, c.column, c.value))
+    unresolved = {(k, r, c) for k, r, c, _ in pending}
+    for _ in range(3):
+        if not pending:
+            break
+        still = []
+        for key, r, c, f in pending:
+            val = _eval_formula(f, grids[key], grids, key, unresolved)
+            if val is not None:
+                grids[key][(r, c)] = val
+                unresolved.discard((key, r, c))
+            else:
+                still.append((key, r, c, f))
+        if len(still) == len(pending):
+            break
+        pending = still
+
+
 def _xlsx(p: Path) -> list[dict]:
     import openpyxl
+
+    import config
     wb_v = openpyxl.load_workbook(p, data_only=True)
     try:
         wb_f = openpyxl.load_workbook(p, data_only=False)
     except Exception:
         wb_f = None
     recs = []
+    # config.XLSX_JOIN: grids of every sheet by lower-cased title, so a formula can read another sheet
+    all_grids: dict[str, dict] | None = None
+    if config.XLSX_JOIN:
+        all_grids = {ws.title.lower(): {(c.row, c.column): c.value for row in _rows_of(ws) for c in row
+                                        if c.value is not None} for ws in wb_v.worksheets}
+        if wb_f is not None:
+            _fill_formulas(wb_f, all_grids)
     for ws in wb_v.worksheets:
         state = getattr(ws, "sheet_state", "visible")
         hidden = state != "visible"
         wsf = wb_f[ws.title] if wb_f else None
-        grid = {}
-        for row in _rows_of(ws):
-            for c in row:
-                if c.value is not None:
-                    grid[(c.row, c.column)] = c.value
+        if all_grids is not None:
+            grid = all_grids[ws.title.lower()]   # built and formula-filled before the loop
+        else:
+            grid = {}
+            for row in _rows_of(ws):
+                for c in row:
+                    if c.value is not None:
+                        grid[(c.row, c.column)] = c.value
         # fill missing cached formula results
-        if wsf is not None:
+        if wsf is not None and all_grids is None:
             for row in _rows_of(wsf):
                 for c in row:
                     if isinstance(c.value, str) and c.value.startswith("=") and \
                             grid.get((c.row, c.column)) in (None, c.value):
-                        val = _eval_formula(c.value, grid)
+                        val = _eval_formula(c.value, grid, all_grids)
                         if val is not None:
                             grid[(c.row, c.column)] = val
         # merged ranges: propagate the top-left value

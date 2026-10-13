@@ -6,6 +6,8 @@ implements the same surface): ``load()``, ``self_test_sdpa() -> bool``, ``warmup
 ``vqa(question, image, deadline, max_new_tokens) -> str``,
 ``transcribe(image, deadline, max_new_tokens) -> str``,
 ``logprob(package_text, question, images, answer) -> float``.
+Optional (H6, ``warrant.check`` skips readers without it): ``yes_no(evidence_text, question, answer, images, deadline)
+-> float | None`` = log P(YES) - log P(NO) of the first reply token.
 
 ``import reader`` is safe without torch/transformers/PIL: every heavy import is inside a function.
 The model is greedy, batch=1, bf16; every forward/generate runs under ``torch.inference_mode()`` and,
@@ -228,6 +230,59 @@ def fold_system(messages: list[dict]) -> list[dict]:
             m = {"role": "user", "content": c}
         out.append(m)
     return out
+
+
+# ---------------------------------------------------------------------------------------------
+# warrant check (H6): YES/NO verification of a proposed answer against its evidence
+# ---------------------------------------------------------------------------------------------
+
+WARRANT_SYSTEM = (
+    "You verify extracted answers against evidence records. Use ONLY the evidence given; never use outside "
+    "knowledge. Reply with exactly one word: YES or NO."
+)
+WARRANT_MIN_REMAINING_S = 3.0
+_WARRANT_YES = ("YES", " YES", "Yes", " Yes", "yes", " yes")
+_WARRANT_NO = ("NO", " NO", "No", " No", "no", " no")
+
+
+def build_warrant_messages(evidence_text: str, question: str, answer: str, images=None) -> list[dict]:
+    """System + user (images first, then EVIDENCE / QUESTION / PROPOSED ANSWER / the YES-NO ask); no assistant turn."""
+    pil, names = _split_images(images)
+    user_text = ("EVIDENCE\n" + evidence_text + ("\n" + image_note(names) if pil else "")
+                 + f"\n\nQUESTION: {question}\nPROPOSED ANSWER: {answer}\n\n"
+                 "Does the evidence explicitly state this value as the answer to exactly this question "
+                 "(same entity/product, same attribute, same condition/unit/date)? Reply YES or NO.")
+    content = [{"type": "image", "image": im} for im in pil] + [{"type": "text", "text": user_text}]
+    return [{"role": "system", "content": WARRANT_SYSTEM}, {"role": "user", "content": content}]
+
+
+def warrant_token_ids(tokenizer) -> tuple[list[int], list[int]]:
+    """Token ids of the YES / NO answers (first token of each spelling variant), disjoint from each other.
+
+    A variant that splits into several tokens only counts when no single-token variant exists for that side."""
+    def ids_of(variants) -> list[int]:
+        single, first = [], []
+        for v in variants:
+            try:
+                ids = list(tokenizer.encode(v, add_special_tokens=False))
+            except Exception:  # noqa: BLE001 - tokenizer without encode kwargs
+                continue
+            if len(ids) == 1:
+                single.append(int(ids[0]))
+            elif ids:
+                first.append(int(ids[0]))
+        return list(dict.fromkeys(single or first))
+
+    yes, no = ids_of(_WARRANT_YES), ids_of(_WARRANT_NO)
+    both = set(yes) & set(no)
+    return [i for i in yes if i not in both], [i for i in no if i not in both]
+
+
+def warrant_margin(yes_lps: list[float], no_lps: list[float]) -> float | None:
+    """log P(YES) - log P(NO): max over the spelling variants of each side; None when a side has no token."""
+    if not yes_lps or not no_lps:
+        return None
+    return float(max(yes_lps) - max(no_lps))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -642,6 +697,34 @@ class Reader:
                     logits = logits[:len(tgt)]
                 lp = torch.log_softmax(logits.float(), dim=-1).gather(1, tgt[:, None].to(logits.device))
                 return float(lp.sum().item())
+
+    def yes_no(self, evidence_text: str, question: str, answer: str, images=None, deadline=None) -> float | None:
+        """log P(YES) - log P(NO) for the first token of the assistant reply to the warrant question (H6).
+
+        One forward pass over the prompt (generation start, no prefill), ``logits_to_keep=1``. None on any error,
+        when fewer than ``WARRANT_MIN_REMAINING_S`` remain, or when the tokenizer has no YES/NO token."""
+        try:
+            if deadline is not None and not deadline.require(WARRANT_MIN_REMAINING_S):
+                return None
+            import torch
+
+            with self._lock:
+                yes_ids, no_ids = warrant_token_ids(self.processor.tokenizer)
+                if not yes_ids or not no_ids:
+                    return None
+                inputs = self._encode(build_warrant_messages(evidence_text, question, answer, images),
+                                      images or [], prefilled=False)
+                kw = {}
+                name = self._logits_to_keep_kw()
+                if name:
+                    kw[name] = 1
+                with torch.inference_mode(), self._ctx():
+                    out = self.model(**inputs, use_cache=False, **kw)
+                    lp = torch.log_softmax(out.logits[0, -1].float(), dim=-1)
+                    return warrant_margin([float(lp[i]) for i in yes_ids], [float(lp[i]) for i in no_ids])
+        except Exception as e:  # noqa: BLE001
+            _log(f"yes_no failed: {type(e).__name__}: {e}")
+            return None
 
     def warmup(self) -> None:
         """One ~6k-token read with a 640x320 image, then one logprob() (exercises logits_to_keep)."""

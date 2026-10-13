@@ -90,7 +90,7 @@ class StubReader:
         self.timings: dict[str, float] = {}
         self.force_math = False
         self.attn = "stub"
-        self.calls: list[str] = []                   # "read"/"vqa"/"transcribe"/"logprob", for tests
+        self.calls: list[str] = []                   # "read"/"vqa"/"transcribe"/"logprob"/"yes_no", for tests
 
     @classmethod
     def from_questions(cls, data: dict, mode: str = "oracle") -> "StubReader":
@@ -208,3 +208,17 @@ class StubReader:
     def logprob(self, package_text: str, question: str, images, answer: str) -> float:
         self.calls.append("logprob")
         return -1.0
+
+    def yes_no(self, evidence_text: str, question: str, answer: str, images=None, deadline=None) -> float:
+        """H6 warrant score. oracle: +5 when ``answer`` is the gold answer of ``question``, -5 otherwise; other modes 0.0."""
+        self.calls.append("yes_no")
+        if self.mode != "oracle":
+            return 0.0
+        g = self._gold(question)
+        gold = str(g.get("expected_answer", "")) if g else ""
+        a = str(answer or "")
+        if not gold or not a.strip():
+            return -5.0
+        same = re.sub(r"[\s\-.·_]", "", a).upper() == re.sub(r"[\s\-.·_]", "", gold).upper()
+        return 5.0 if same or textnorm.find_span(a, gold) is not None or textnorm.find_span(gold, a) is not None \
+            else -5.0
